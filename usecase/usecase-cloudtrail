@@ -1,0 +1,335 @@
+# ML-Based Threat Detection Usecases for AWS CloudTrail Logs (Based on MITRE ATT&CK for Cloud)
+
+This document outlines malicious activities in an AWS environment, which can be detected by analyzing CloudTrail logs using machine learning models. Each use case is mapped to the MITRE ATT&CK for Cloud framework.
+
+---
+
+### Tactic: Initial Access (초기 접근)
+
+**1.1. Usecase: Valid Accounts - Compromised IAM User Credentials**
+- **Description:** An attacker uses stolen IAM user credentials (Access Key) to gain initial access. The ML model should detect anomalous login patterns.
+- **Technique ID:** T1078.004
+- **Key CloudTrail Events:** `ConsoleLogin`, `SwitchRole`, any API call event.
+- **Key Log Fields for ML:**
+  - `sourceIPAddress`: Is the IP from a new or suspicious ASN, country, or is it a known TOR node/VPN?
+  - `userAgent`: Is the user agent unusual for this user (e.g., CLI used by a console-only user)?
+  - `eventTime`: Does the activity occur at an abnormal time?
+  - `errorCode`: A high rate of `AccessDenied` or `Failure` errors can indicate brute-forcing or reconnaissance.
+
+**1.2. Usecase: Access from Unusual Geographic Locations**
+- **Description:** Assuming normal operations are based in a specific country (e.g., South Korea), any access from high-risk countries (e.g., China, Russia, North Korea) or unexpected regions (e.g., Eastern Europe, Africa) is flagged as suspicious. This applies to both long-term keys and temporary STS credentials.
+- **Technique ID:** T1078.004
+- **Key CloudTrail Events:** Any API call, especially `ConsoleLogin` and `AssumeRole`.
+- **Key Log Fields for ML:**
+  - `sourceIPAddress`: The source IP of the API call.
+  - `userIdentity.arn`: The identity performing the action.
+  - `eventName`: The specific action being performed.
+- **ML Model Approach:** This requires a feature engineering step to enrich the `sourceIPAddress` with GeoIP information (country, city, ASN). The model can then be trained in two ways:
+    1.  **Supervised:** Create a feature that flags IPs from a predefined list of high-risk or unexpected countries. The model learns to associate this flag with malicious activity.
+    2.  **Unsupervised (Anomaly Detection):** The model establishes a baseline of normal access patterns for each user (e.g., `user-A` always logs in from South Korea). An access attempt from a new country becomes a high-scoring anomaly.
+
+**1.3. Usecase: Exposed EKS Cluster API Endpoint**
+- **Description:** An attacker or misconfiguration changes an EKS cluster's API endpoint from private to public, or modifies the public access CIDRs to be overly permissive (`0.0.0.0/0`). This exposes the Kubernetes API to the internet, creating a major attack surface.
+- **Technique ID:** T1190 (Exploit Public-Facing Application)
+- **Key CloudTrail Events:** `UpdateClusterConfig` (from `eks.amazonaws.com`).
+- **Key Log Fields for ML:**
+  - `eventName`: `UpdateClusterConfig`.
+  - `requestParameters.name`: The name of the EKS cluster being modified.
+  - `requestParameters.resourcesVpcConfig.endpointPublicAccess`: The model should flag a change from `false` to `true`.
+  - `requestParameters.resourcesVpcConfig.publicAccessCidrs`: The model should parse this array and flag if it contains `0.0.0.0/0` or other overly broad CIDR ranges.
+- **ML Model Approach:** This is a high-confidence indicator of a critical misconfiguration. A rule-based alert is highly effective here. An ML model can provide additional value by learning which users or roles are authorized to make such changes and flagging unauthorized modifications as anomalous.
+
+---
+
+### Tactic: Persistence (권한 유지)
+
+**2.1. Usecase: Create New IAM User for Backdoor Access**
+- **Description:** An attacker creates a new IAM user to maintain access even if the initially compromised user's credentials are changed.
+- **Technique ID:** T1098
+- **Key CloudTrail Events:** `CreateUser`, `CreateLoginProfile`, `CreateAccessKey`, `AttachUserPolicy`.
+- **Key Log Fields for ML:**
+  - `eventName`: A sequence of these events in a short time frame is highly suspicious.
+  - `requestParameters.userName`: Look for unusual naming conventions (e.g., "backup", "admin-temp").
+  - `sourceIPAddress`: Was the user created from an anomalous location?
+  - `userIdentity.arn`: Which user created this new user? Was it a user who doesn't typically perform admin tasks?
+
+**2.2. Usecase: Modify IAM Role Trust Policy**
+- **Description:** An attacker modifies an existing IAM role's trust policy to allow an external, attacker-controlled AWS account to assume that role.
+- **Technique ID:** T1098
+- **Key CloudTrail Events:** `UpdateAssumeRolePolicy`.
+- **Key Log Fields for ML:**
+  - `requestParameters.policyDocument`: The ML model should parse this JSON and flag when a new external AWS Principal ARN is added.
+  - `sourceIPAddress`: The source of the policy change.
+  - `userIdentity.arn`: The identity that performed the change.
+
+**2.3. Usecase: "Low and Slow" Periodic Access**
+- **Description:** An attacker uses a compromised long-term access key or assumes a role via STS periodically (e.g., exactly once every 24 hours) to perform minor reconnaissance or maintain a foothold. This low-frequency activity is designed to evade simple threshold-based alerts.
+- **Technique ID:** T1136 (Create Account) or T1078 (Valid Accounts)
+- **Key CloudTrail Events:** Any API call, but often `GetCallerIdentity`, `List*`, `Describe*` events.
+- **Key Log Fields for ML:**
+  - `eventTime`: The timestamp of the event.
+  - `userIdentity.accessKeyId`: The key used for the action.
+  - `eventName`: The specific API call.
+- **ML Model Approach:** This is a prime use case for unsupervised anomaly detection. The model needs to establish a baseline of API call frequency and periodicity for each user or access key. A highly regular, automated pattern of access (e.g., a single `GetCallerIdentity` call every 24 hours +/- a few minutes) from a user key that is not associated with a known, legitimate automation script is a strong anomaly. The model should analyze the time delta between events for a specific key to detect unnatural regularity.
+
+---
+
+### Tactic: Privilege Escalation (권한 상승)
+
+**3.1. Usecase: Exploiting Misconfigured IAM Policies**
+- **Description:** A compromised user with limited permissions exploits a misconfiguration (e.g., `iam:CreatePolicyVersion`, `iam:SetDefaultPolicyVersion`) to grant themselves Administrator access.
+- **Technique ID:** T1068
+- **Key CloudTrail Events:** `CreatePolicyVersion`, `SetDefaultPolicyVersion`, `AttachUserPolicy`, `AttachGroupPolicy`.
+- **Key Log Fields for ML:**
+  - `eventName`: A sequence where a user creates a new policy version and immediately applies it to themselves or their group.
+  - `requestParameters.policyDocument`: Analyze the policy content for privilege-escalating permissions like `"Action": "*", "Resource": "*"`.
+  - `userIdentity.type`: Is a typically non-admin user performing these actions?
+
+**3.2. Usecase: Malicious Role Assumption via STS**
+- **Description:** An attacker uses `sts:AssumeRole` to escalate privileges, move laterally to another AWS account, or obscure their identity by using temporary credentials. The ML model should detect anomalous or chained role assumptions.
+- **Technique ID:** T1556.001 (Domain Accounts) / T1078.004 (Cloud Accounts)
+- **Key CloudTrail Events:** `AssumeRole` (from `sts.amazonaws.com`).
+- **Key Log Fields for ML:**
+  - `userIdentity.arn`: The source identity assuming the role. Is this a normal behavior for this identity?
+  - `requestParameters.roleArn`: The target role being assumed. Is it a high-privilege role? Is this assumption pattern new?
+  - `sourceIPAddress`: Is the assumption originating from a new or untrusted IP address?
+  - `requestParameters.roleSessionName`: Look for unusual or generic session names (e.g., "aws-cli-session-12345").
+  - `responseElements.assumedRoleUser.arn`: The temporary ARN created. The model should track actions performed by this temporary ARN and link them back to the original `AssumeRole` call.
+
+**3.3. Usecase: Cross-Account Access via Assumed Role Exploitation (신뢰 관계 악용)**
+- **Description:** An attacker, having compromised a role with a trust policy allowing it to assume roles in other accounts, uses this capability to move laterally and escalate privileges in a trusted account. The model should detect when a role assumption is used to access a different account, especially if the target role is highly privileged or the action is anomalous for the source entity.
+- **Technique ID:** T1078.004
+- **Key CloudTrail Events:** `AssumeRole` (from `sts.amazonaws.com`).
+- **Key Log Fields for ML:**
+    - `userIdentity.arn`: The ARN of the identity assuming the role.
+    - `requestParameters.roleArn`: The ARN of the role being assumed. The model must parse this ARN to extract the AWS Account ID of the target role.
+    - `recipientAccountId`: The AWS Account ID where the `AssumeRole` call is made.
+    - `sourceIPAddress`: The IP address where the request originated.
+    - `responseElements.assumedRoleUser.arn`: The temporary ARN created in the target account.
+- **ML Model Approach:**
+    1.  **Feature Engineering:** Create a feature `is_cross_account` which is `true` if the account ID in `userIdentity.arn` is different from the account ID in `requestParameters.roleArn`.
+    2.  **Anomaly Detection:** Establish a baseline of normal cross-account role assumptions. The model should flag assumptions that are anomalous based on:
+        - **New Source-Target Pair:** A role from `Account A` assuming a role in `Account B` for the first time.
+        - **Anomalous Target Role:** The assumed role in the target account is unusually privileged (e.g., `AdministratorAccess`).
+        - **Anomalous Source:** The `userIdentity` performing the cross-account assumption has never done so before.
+        - **Suspicious Follow-up Activity:** Track the actions performed by the temporary credentials (`responseElements.assumedRoleUser.arn`) in the target account. A chain of `AssumeRole` followed by sensitive actions (e.g., `CreateUser`, `PutRolePolicy`) in the target account is highly suspicious.
+
+**3.4. Usecase: AssumeRole Chaining Attack (AssumeRole 체인 공격)**
+- **Description:** An attacker who has compromised an initial IAM identity (user or role) performs a series of `AssumeRole` calls, where the credentials from one assumed role are used to assume another role. This technique is used to escalate privileges, move laterally across accounts, or obscure the attacker's original identity.
+- **Technique ID:** T1556.001 (Domain Accounts) / T1078.004 (Cloud Accounts)
+- **Key CloudTrail Events:** `AssumeRole` (from `sts.amazonaws.com`).
+- **Key Log Fields for ML:**
+    - `userIdentity.type`: `AssumedRole`. This is key, as it shows the action was performed by temporary credentials.
+    - `userIdentity.arn`: The ARN of the identity performing the assumption.
+    - `requestParameters.roleArn`: The ARN of the role being assumed.
+    - `responseElements.assumedRoleUser.arn`: The temporary ARN created by the assumption.
+    - `eventTime`: Timestamp to correlate the events.
+- **ML Model Approach:**
+    1.  **Graph-Based Analysis:** The model needs to construct a graph of role assumptions. Each `AssumeRole` event is an edge from the `userIdentity.arn` (source node) to the `requestParameters.roleArn` (target node). The temporary credentials (`responseElements.assumedRoleUser.arn`) are then linked to the target node.
+    2.  **Detect Deep Chains:** The model should flag assumption chains that exceed a certain depth (e.g., more than 2 or 3 hops). Legitimate automation rarely involves deep role chaining. `User -> Role A -> Role B` might be normal, but `User -> Role A -> Role B -> Role C` is highly suspicious.
+    3.  **Detect Anomalous Paths:** The model should establish a baseline of normal assumption paths. A new or previously unseen path in the graph is an anomaly. For example, if `Role A` normally only assumes `Role B`, but suddenly assumes `Role C`, this should be flagged.
+    4.  **Privilege Escalation Detection:** The model should analyze the permissions of each role in the chain. A chain is high-risk if a role with low privileges assumes a role with significantly higher privileges (e.g., a read-only role assuming an admin role).
+    5.  **Circular Dependencies:** The model should look for circular assumption patterns (e.g., `Role A` assumes `Role B`, and `Role B` assumes `Role A`), which are almost always a sign of misconfiguration or malicious activity.
+
+---
+
+### Tactic: Defense Evasion (방어 회피)
+
+**4.1. Usecase: Disabling or Deleting Security Logs**
+- **Description:** The attacker stops or deletes CloudTrail logs to hide their activities. This is a high-confidence indicator of an attack.
+- **Technique ID:** T1562.001
+- **Key CloudTrail Events:** `StopLogging`, `DeleteTrail`, `UpdateTrail` (to disable logging or change S3 bucket).
+- **Key Log Fields for ML:**
+  - `eventName`: These event names are critical alerts by themselves.
+  - `userIdentity.arn`: Who performed this action?
+  - `sourceIPAddress`: Where did the request originate?
+  - **ML Model Approach:** These events are so critical that they can be treated as a "rule-based" trigger for the highest alert level, rather than a probability score.
+
+**4.2. Usecase: Disabling Security Services**
+- **Description:** The attacker disables threat detection services like GuardDuty or Security Hub.
+- **Technique ID:** T1562.001
+- **Key CloudTrail Events:** `StopMonitoringMembers`, `DeleteDetector`, `DisableSecurityHub`, `UpdateDetector`.
+- **Key Log Fields for ML:**
+  - `eventSource`: `guardduty.amazonaws.com`, `securityhub.amazonaws.com`.
+  - `eventName`: The specific disabling action.
+  - **ML Model Approach:** Similar to disabling CloudTrail, this is a high-confidence indicator.
+
+**4.3. Usecase: Access from Anonymizing Services (Tor/VPN)**
+- **Description:** An attacker uses a Tor exit node or a known commercial VPN service to hide their true IP address when accessing AWS resources with either long-term keys (IAM User) or temporary credentials (STS).
+- **Technique ID:** T1090.003 (Proxy: Multi-hop Proxy)
+- **Key CloudTrail Events:** Any API call, but particularly sensitive ones like `ConsoleLogin`, `AssumeRole`, `CreateUser`, `RunInstances`.
+- **Key Log Fields for ML:**
+  - `sourceIPAddress`: The source IP of the API call.
+  - `userIdentity.type`: `IAMUser`, `AssumedRole`, etc.
+  - `eventName`: The specific action being performed.
+- **ML Model Approach:** The model must enrich the `sourceIPAddress` field by cross-referencing it with external threat intelligence feeds (lists of known Tor exit nodes, VPNs, and malicious IPs). If an IP matches, it significantly increases the risk score of that event. This is a feature engineering step. The model then learns which events from these IPs are most likely to be malicious.
+
+---
+
+### Tactic: Credential Access (자격 증명 접근)
+
+**5.1. Usecase: Accessing Secrets from Secrets Manager**
+- **Description:** An attacker who has compromised an EC2 instance or a user role attempts to retrieve sensitive data like database credentials or API keys stored in AWS Secrets Manager.
+- **Technique ID:** T1552.005
+- **Key CloudTrail Events:** `GetSecretValue`.
+- **Key Log Fields for ML:**
+  - `userIdentity.arn`: Is this identity (e.g., an EC2 instance role) expected to access this specific secret?
+  - `requestParameters.secretId`: Is there a sudden spike in access to multiple, different secrets from one source?
+  - `sourceIPAddress`: Is the request coming from an unexpected region or IP?
+
+**5.2. Usecase: Instance Metadata Exploitation - Stealing IAM Credentials via IMDSv1 (인스턴스 메타데이터 악용)**
+- **Description:** An attacker who has gained access to an EC2 instance (e.g., via a web application vulnerability like SSRF) queries the Instance Metadata Service (IMDS) to steal the temporary IAM credentials associated with the instance's role. This is particularly effective against IMDSv1, which lacks session-based protection. The stolen credentials are then used to perform unauthorized actions from an external IP address.
+- **Technique ID:** T1552.005 (Cloud Instance Metadata API)
+- **Key CloudTrail Events:** Any API call. The key is not the event itself, but the characteristics of the `userIdentity`.
+- **Key Log Fields for ML:**
+    - `userIdentity.type`: `AssumedRole`.
+    - `userIdentity.principalId`: The unique ID of the assumed role session (e.g., `AROAXXXXXXXXXXXXXXXXX:i-0123456789abcdef0`). The model should track the instance ID part (`i-0123...`).
+    - `sourceIPAddress`: The source IP of the API call.
+    - `eventName`: Any, but often starts with reconnaissance (`List*`, `Describe*`) and escalates to data access (`GetSecretValue`) or persistence (`CreateUser`).
+- **ML Model Approach:**
+    1.  **Baseline Normal Behavior:** The model must first establish a baseline of normal activity for each EC2 instance role. For a given `userIdentity.principalId` (which contains the instance ID), the `sourceIPAddress` should almost always be the private IP of the EC2 instance itself or from within the VPC.
+    2.  **Detect Anomalous Source IP:** The core of the detection is flagging when API calls made using credentials originating from an EC2 instance (`userIdentity.principalId`) come from a `sourceIPAddress` that is *external* to the AWS environment (i.e., not a private IP, not the instance's public IP, and not from a known corporate IP range).
+    3.  **Flag Suspicious Activity:** Once an external IP is detected using the instance's credentials, the model should flag all subsequent actions from that IP using those credentials, especially high-risk events like `CreateUser`, `PutRolePolicy`, `GetSecretValue`, or any data exfiltration patterns.
+
+**5.3. Usecase: Malicious Use of STS Short-Term Access Keys (ASIA-로 시작하는 키)**
+- **Description:** An attacker obtains short-term AWS STS credentials (e.g., via compromised EC2 instance, web application vulnerability, or phishing) and uses them to perform malicious activities. These keys often start with "ASIA" and have a limited lifespan. The detection focuses on anomalous behavior originating from these temporary credentials.
+- **Technique ID:** T1078.004 (Valid Accounts)
+- **Key CloudTrail Events:** Any API call where `userIdentity.accessKeyId` starts with `ASIA`.
+- **Key Log Fields for ML:**
+    - `userIdentity.accessKeyId`: The access key ID. The model should specifically look for keys starting with `ASIA`.
+    - `userIdentity.type`: `AssumedRole` or `FederatedUser`.
+    - `userIdentity.sessionContext.attributes.mfaAuthenticated`: Whether MFA was used.
+    - `sourceIPAddress`: The source IP of the API call.
+    - `eventName`: The specific action being performed.
+    - `eventTime`: Timestamp of the event.
+- **ML Model Approach:**
+    1.  **Identify STS Keys:** Filter CloudTrail logs for events where `userIdentity.accessKeyId` starts with `ASIA`.
+    2.  **Baseline Normal STS Usage:** Establish a baseline of normal activities performed by legitimate STS keys within the environment. This includes:
+        - **Common Source IPs:** From where do these keys normally originate? (e.g., specific EC2 instances, trusted networks).
+        - **Expected Event Types:** What API calls are typically made by these keys? (e.g., `s3:GetObject`, `dynamodb:GetItem`).
+        - **Typical Volume/Frequency:** How often are these keys used, and what's the normal volume of API calls?
+        - **Associated Roles/Users:** Which roles or federated users typically assume these keys?
+    3.  **Anomaly Detection on STS Key Usage:** Flag anomalies based on deviations from the baseline:
+        - **Unusual `sourceIPAddress`:** Access from a new, suspicious, or external IP address not typically associated with legitimate STS key usage.
+        - **Unusual `eventName`:** Performing actions not typically associated with the assumed role or federated user (e.g., `iam:CreateUser`, `s3:PutBucketPolicy`, `ec2:RunInstances` by a key that normally only reads S3).
+        - **High Volume/Frequency:** A sudden spike in API calls from a single STS key, especially if it's performing reconnaissance (`List*`, `Describe*`) or destructive actions.
+        - **Lack of MFA:** If the assumed role or federated user typically requires MFA, but the STS key is used without it.
+        - **Correlation with Preceding Events:** Correlate the use of the STS key with preceding `AssumeRole` or `GetFederationToken` events. If the `AssumeRole` call itself was anomalous (e.g., from a suspicious IP, by an unusual user), then subsequent actions by the resulting STS key are higher risk.
+
+---
+
+### Tactic: Discovery (탐지)
+
+**6.1. Usecase: Reconnaissance of AWS Infrastructure**
+- **Description:** The attacker performs a broad reconnaissance of the environment by listing users, roles, instances, buckets, etc., to understand the infrastructure and find valuable targets.
+- **Technique ID:** T1580
+- **Key CloudTrail Events:** A high volume of `List*`, `Describe*`, `Get*` API calls in a short period. (e.g., `ListUsers`, `DescribeInstances`, `ListBuckets`, `GetRolePolicy`).
+- **Key Log Fields for ML:**
+  - `userIdentity.arn`: A single user making an abnormally high number of discovery calls compared to their baseline behavior.
+  - `eventTime`: A burst of activity.
+  - `readOnly`: True (as these are discovery calls).
+  - **ML Model Approach:** Use anomaly detection (e.g., unsupervised learning) to establish a baseline of "normal" discovery activity for each user/role and flag significant deviations.
+
+---
+
+### Tactic: Collection (수집)
+
+**7.1. Usecase: Creating Snapshots of EBS/RDS for Data Theft**
+- **Description:** An attacker creates a snapshot of a critical database (RDS) or server disk (EBS) and shares it with their own external AWS account to steal the data in bulk.
+- **Technique ID:** T1213
+- **Key CloudTrail Events:** `CreateDBSnapshot`, `CreateSnapshot`, `ModifyDBSnapshotAttribute`, `ModifySnapshotAttribute`.
+- **Key Log Fields for ML:**
+  - `eventName`: A `Create*` event followed by a `Modify*Attribute` event is a classic pattern for data exfiltration via snapshots.
+  - `requestParameters.attributeName`: Look for `restore`.
+  - `requestParameters.valuesToAdd`: The attacker's external AWS account ID will be present here. The model should flag any unfamiliar account IDs.
+
+**7.2. Usecase: Publicly Exposing RDS/Database Snapshot (RDS/데이터베이스 스냅샷 공개 노출)**
+- **Description:** An attacker modifies the permissions of an RDS or Aurora DB snapshot to make it publicly accessible, allowing anyone to restore the database and access its contents. This is a direct and high-risk method of data exfiltration.
+- **Technique ID:** T1213 (Data from Information Repositories)
+- **Key CloudTrail Events:** `ModifyDBSnapshotAttribute`
+- **Key Log Fields for ML:**
+  - `eventName`: `ModifyDBSnapshotAttribute`.
+  - `requestParameters.dBSnapshotIdentifier`: The snapshot being modified.
+  - `requestParameters.attributeName`: The model must check for the value `restore`.
+  - `requestParameters.valuesToAdd`: The critical indicator is the presence of the `all` group in this field, which represents public access.
+  - `userIdentity.arn`: The identity that performed the action.
+- **ML Model Approach:** This is a high-confidence, low-volume event that is almost always malicious or a severe misconfiguration. A rule-based alert looking for `ModifyDBSnapshotAttribute` where `valuesToAdd` contains `all` is highly effective and should be treated as a critical finding.
+
+---
+
+### Tactic: Exfiltration (유출)
+
+**8.1. Usecase: Making S3 Bucket Public for Data Retrieval**
+- **Description:** An attacker changes the policy or ACL of an S3 bucket containing sensitive data to make it publicly accessible.
+- **Technique ID:** T1537
+- **Key CloudTrail Events:** `PutBucketPolicy`, `PutBucketAcl`.
+- **Key Log Fields for ML:**
+  - `requestParameters.policyDocument` or `requestParameters.AccessControlPolicy`: The model needs to parse the policy and identify grants to `Principal: "*"` or `URI: ".../AllUsers"`.
+  - `requestParameters.bucketName`: Which bucket was affected?
+  - **ML Model Approach:** This can be a combination of rule-based detection (for "AllUsers") and anomaly detection (a bucket that has never been public suddenly changing state).
+
+**8.2. Usecase: Data Exfiltration via EC2 Staging Point (데이터 유출 중계점)**
+- **Description:** An attacker uses a compromised or newly created EC2 instance as a relay to transfer data from internal resources (like S3 buckets or RDS databases) to an external, attacker-controlled server. While the actual data transfer is invisible to CloudTrail, the setup and preparation activities are often detectable. This use case focuses on detecting the precursor activities in CloudTrail, which should be correlated with VPC Flow Logs for high-fidelity alerts.
+- **Technique ID:** T1041 (Exfiltration Over C2 Channel)
+- **Key CloudTrail Events (Precursor Indicators):**
+  - `RunInstances`: Launching a new EC2 instance, especially in an unusual region or with a suspicious name.
+  - `CreateSecurityGroup`, `AuthorizeSecurityGroupEgress`: Creating a new security group or modifying an existing one to allow outbound traffic to the entire internet (`0.0.0.0/0`) on ports commonly used for exfiltration (e.g., 22, 53, 443, 8080).
+  - `CreateVpcPeeringConnection`, `AcceptVpcPeeringConnection`: Creating a connection to an unknown or unauthorized VPC.
+- **Key Log Fields for ML (from CloudTrail):**
+  - `eventName`: A sequence of `RunInstances` followed by `AuthorizeSecurityGroupEgress` is highly suspicious.
+  - `requestParameters.ipPermissions`: In `AuthorizeSecurityGroupEgress`, the model should flag rules with `CidrIp` set to `0.0.0.0/0`.
+  - `awsRegion`: The region where the instance was launched.
+  - `userIdentity.arn`: The identity performing these setup actions.
+- **Primary Data Source for Confirmation:** VPC Flow Logs (requires separate analysis). The ML model should primarily analyze VPC Flow Logs for:
+  - **Anomalous Egress Volume:** A sudden and large volume of outbound data from an EC2 instance to a single external IP address.
+  - **Anomalous Destination:** Traffic going to a new or low-reputation IP, ASN, or country.
+  - **Protocol/Port Mismatch:** Using a common port (like 53 for DNS) for large, sustained data transfers.
+- **ML Model Approach:**
+  1.  **CloudTrail Anomaly Detection:** Use an unsupervised model to detect anomalous sequences of the precursor events (`RunInstances` -> `AuthorizeSecurityGroupEgress`).
+  2.  **VPC Flow Log Anomaly Detection:** Use an unsupervised model to establish a baseline of network traffic for each instance profile and flag significant deviations in bytes transferred, destination IPs, and connection duration.
+  3.  **Combined Alerting:** A high-risk alert is generated when a CloudTrail anomaly (e.g., permissive egress rule created) is followed by a VPC Flow Log anomaly (e.g., large data transfer) from the same EC2 instance.
+
+**8.3. Usecase: Data Exfiltration - Massive S3 Download and External Transfer (데이터 탈취: 대량 다운로드 및 외부 전송)**
+- **Description:** An attacker, using compromised credentials, exfiltrates large volumes of data from S3 buckets. This is characterized by an unusually high number of `GetObject` events, often originating from a single identity and directed to a suspicious external IP address. This requires analysis of S3 data events (e.g., via CloudTrail S3 data event logging).
+- **Technique ID:** T1048 (Exfiltration Over Alternative Protocol), T1537 (Transfer Data to Cloud Account)
+- **Primary Data Source:** S3 Data Events in CloudTrail.
+- **Key CloudTrail Data Events:** `GetObject`.
+- **Key Log Fields for ML:**
+    - `userIdentity.arn`: The identity performing the downloads.
+    - `sourceIPAddress`: The IP address receiving the data. This is a critical field for identifying external transfers.
+    - `eventTime`: To measure the frequency and volume of downloads over time.
+    - `requestParameters.bucketName`: The S3 bucket being targeted.
+    - `resources.ARN`: The specific S3 object ARN being accessed.
+    - `bytesTransferred`: The size of the data transferred in the response.
+- **ML Model Approach:**
+    1.  **Volume-Based Anomaly Detection:** Establish a baseline for the number of `GetObject` requests and total `bytesTransferred` for each user/role over a given time window. A sudden, massive spike in either metric from a single identity is a primary indicator of exfiltration.
+    2.  **Anomalous Source IP:** Correlate the download spike with the `sourceIPAddress`. The model should flag downloads going to IPs that are new, from an unusual geographic location (GeoIP enrichment), or match a threat intelligence feed of known malicious IPs.
+    3.  **Anomalous Access Patterns:** The model can learn normal access patterns for specific buckets or prefixes. A user suddenly accessing and downloading a large number of objects from a bucket they have never interacted with before is highly suspicious.
+    4.  **Correlation with Management Events:** Correlate a massive download event with preceding suspicious management events, such as a user being granted new S3 read permissions or a bucket policy being made more permissive.
+
+---
+
+### Tactic: Impact (영향)
+
+**9.1. Usecase: Cryptojacking via Unauthorized EC2 Instances**
+- **Description:** An attacker runs a large number of expensive, high-CPU or GPU-intensive EC2 instances for cryptocurrency mining. This is often followed by creating permissive security group rules to allow communication with mining pools.
+- **Technique ID:** T1496 (Resource Hijacking)
+- **Key CloudTrail Events:** `RunInstances`, `CreateSecurityGroup`, `AuthorizeSecurityGroupIngress`.
+- **Key Log Fields for ML:**
+  - `eventName`: A sequence of `RunInstances` followed by `AuthorizeSecurityGroupIngress` is a strong indicator.
+  - `awsRegion`: Was the instance launched in a region not typically used by the organization (e.g., `us-east-1` if you only use `ap-northeast-2`)?
+  - `requestParameters.instanceType`: Look for instance families optimized for computing (`g*`, `p*`, `c*`, `x*`) or an unusually large number of vCPUs.
+  - `requestParameters.maxCount`: A high number of instances launched at once.
+  - `requestParameters.ipPermissions`: In `AuthorizeSecurityGroupIngress` events, look for egress rules (`toPort`, `fromPort`) opened to `0.0.0.0/0` on ports commonly used by mining pools (e.g., 3333, 4444, 5555).
+  - `sourceIPAddress`: A known malicious IP or an unusual location.
+- **ML Model Approach:** Anomaly detection on the combination of region, instance type, and count against the organization's baseline. The model can also learn to flag sequences of `RunInstances` -> `AuthorizeSecurityGroupIngress` as a high-risk pattern.
+
+**9.2. Usecase: Destructive Activity - Deleting Resources**
+- **Description:** An attacker attempts to disrupt business operations by deleting critical resources.
+- **Technique ID:** T1485
+- **Key CloudTrail Events:** `TerminateInstances`, `DeleteBucket`, `DeleteDBInstance`, `DeleteVolume`, `DeletePolicy`, `DeleteUser`.
+- **Key Log Fields for ML:**
+  - `eventName`: A high frequency of `Delete*` or `Terminate*` events.
+  - `userIdentity.arn`: Is a non-admin or unexpected user performing these actions?
+  - `eventTime`: Does this occur outside of business hours?
+  - **ML Model Approach:** Detect a sudden spike in destructive API calls, especially when performed by an identity that doesn't have a history of such actions.
