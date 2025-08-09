@@ -1,0 +1,44 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: cloudtrail-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - CLOUDTRAIL_HOST=0.0.0.0
+      - CLOUDTRAIL_PORT=8000
+      - CLOUDTRAIL_DATA_DIR=/app/output
+    volumes:
+      - ./output:/app/output:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: cloudtrail-frontend
+    ports:
+      - "8501:8501"
+    environment:
+      - CLOUDTRAIL_API_URL=http://backend:8000
+    depends_on:
+      - backend
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+networks:
+  default:
+    name: cloudtrail-network
